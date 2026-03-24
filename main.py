@@ -4,6 +4,7 @@ from llama_index.core import (
     SimpleDirectoryReader,
     VectorStoreIndex,
     StorageContext,
+    ServiceContext,
     load_index_from_storage
 )
 from llama_index.llms.google_genai import GoogleGenAI
@@ -11,6 +12,13 @@ from llama_index.core.node_parser import SentenceSplitter
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.core import Settings
+# setup Arize Phoenix for logging/observability
+import phoenix as px
+px.launch_app()
+llama_index.set_global_handler("arize_phoenix")
+from llama_index.query_pipeline import QueryPipeline
+from llama_index.prompts import PromptTemplate
+
 
 load_dotenv()
 
@@ -49,7 +57,7 @@ query_engine = RetrieverQueryEngine.from_args(
 
 print("Generating response...")
 response = query_engine.query(
-    "What are the features of this device?"
+    "List out the features of this device"
 )
 
 print(response)

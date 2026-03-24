@@ -10,5 +10,12 @@ uv venv --python 3.12.12
 
 2. Install necessary dependencies
 ```
-uv pip install llama-index-core llama-index-embeddings-huggingface torch python-dotenv
+uv pip install llama-index llama-index-core llama-index-embeddings-huggingface torch python-dotenv phoenix
 ```
+
+3. Create .env file and add Google API Key
+```
+GOOGLE_API_KEY="your_api_key"
+```
+
+4. Run the notebook
