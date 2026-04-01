@@ -10,7 +10,7 @@ uv venv --python 3.12.12
 
 2. Install necessary dependencies
 ```
-uv pip install llama-index llama-index-core llama-index-embeddings-huggingface torch python-dotenv phoenix
+uv sync
 ```
 
 3. Create .env file and add Google API Key
