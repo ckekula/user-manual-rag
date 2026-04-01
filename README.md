@@ -13,9 +13,10 @@ uv venv --python 3.12.12
 uv sync
 ```
 
-3. Create .env file and add Google API Key
+3. Create .env file and add Llama Cloud and Google API Keys
 ```
 GOOGLE_API_KEY="your_api_key"
+LLAMA_CLOUD_API_KEY = "your_api_key"
 ```
 
 4. Run the notebook
