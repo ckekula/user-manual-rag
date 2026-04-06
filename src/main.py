@@ -18,6 +18,10 @@ from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.core.settings import Settings
 from llama_cloud import AsyncLlamaCloud
 
+from multimodal_loader import extract_tables
+
+
+
 # logging
 import logging
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
@@ -33,7 +37,8 @@ client = AsyncLlamaCloud(api_key=os.getenv("LLAMA_CLOUD_API_KEY"))
 # initialize the LLM and embedding model
 if os.getenv("APP_ENV") == "dev":
     embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-small-en-v1.5")
-    gemini = GoogleGenAI(model="gemini-2.5-flash-lite")
+    llm = GoogleGenAI(model="gemini-2.5-flash-lite")
+    # gemini = GoogleGenAI(model="gemini-2.5-flash-lite")
 elif os.getenv("APP_ENV") == "prod":
     embed_model = HuggingFaceEmbedding(model_name="Qwen/Qwen3-Embedding-0.6B")
     llm = Vllm(
@@ -98,7 +103,18 @@ async def parse_documents_with_llamaparse(data_dir: str):
     return documents
 
 async def main():
-    documents = await parse_documents_with_llamaparse("../data")
+    # documents = await parse_documents_with_llamaparse("../data")
+
+    text_documents = await parse_documents_with_llamaparse("../data")
+
+    table_documents = []
+    for filename in os.listdir("../data"):
+        if filename.endswith(".pdf"):
+            pdf_path = os.path.join("../data", filename)
+            table_documents.extend(extract_tables(pdf_path))
+
+    # Combine both
+    documents = text_documents + table_documents
 
     print("Chunking documents into nodes...")
     splitter = SentenceSplitter(chunk_size=512, chunk_overlap=50)
@@ -124,7 +140,7 @@ async def main():
 
     print("Generating response...")
     response = await query_engine.aquery(
-        "What is the name of this device?"
+        "what color is the PWR Indicator LED when the device is powered on?"
     )
     print(response)
 
