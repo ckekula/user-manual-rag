@@ -1,6 +1,8 @@
 import os
 import sys
+import json
 import asyncio
+from ast import literal_eval
 from dotenv import load_dotenv
 from llama_index.core import (
     Document,
@@ -28,12 +30,15 @@ logging.getLogger("fsspec").setLevel(logging.WARNING)
 set_global_handler("simple")
 
 load_dotenv()
+CACHE_DIR = "../parsed_cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
+
 client = AsyncLlamaCloud(api_key=os.getenv("LLAMA_CLOUD_API_KEY"))
 
 # initialize the LLM and embedding model
 if os.getenv("APP_ENV") == "dev":
     embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-small-en-v1.5")
-    gemini = GoogleGenAI(model="gemini-2.5-flash-lite")
+    llm = GoogleGenAI(model="gemini-2.5-flash-lite")
 elif os.getenv("APP_ENV") == "prod":
     embed_model = HuggingFaceEmbedding(model_name="Qwen/Qwen3-Embedding-0.6B")
     llm = Vllm(
@@ -54,9 +59,27 @@ async def parse_documents_with_llamaparse(data_dir: str):
         if not filename.endswith(".pdf"):
             continue
 
+        cache_file = os.path.join(CACHE_DIR, f"{filename}.json")
+
+        # load from cache
+        if os.path.exists(cache_file):
+            print(f"Loading cached parse for {filename}...")
+            with open(cache_file, "r") as f:
+                pages = json.load(f)
+
+            for page in pages:
+                documents.append(
+                    Document(
+                        text=page["text"],
+                        metadata=page["metadata"]
+                    )
+                )
+            continue
+
+        # parse normally
         file_path = os.path.join(data_dir, filename)
 
-        print("Uploading file to LlamaCloud...")
+        print(f"Uploading {filename} to LlamaCloud...")
         file_obj = await client.files.create(
             file=file_path,
             purpose="parse"
@@ -68,23 +91,28 @@ async def parse_documents_with_llamaparse(data_dir: str):
             tier="cost_effective",
             version="latest",
             agentic_options={
-                "custom_prompt": "This is an equipment manual. Pay special attention to technical specifications, limitations and warnings."
+                "custom_prompt": "This is an equipment manual..."
             },
             output_options={
                 "markdown": {
-                    "tables": {
-                        "output_tables_as_markdown": True,
-                    },
+                    "tables": {"output_tables_as_markdown": True},
                 },
                 "images_to_save": ["embedded"],
             },
             expand=["markdown"]
         )
 
-        print(result.job.status)
-        print(result.markdown)
-        print(f"Extracting pages...")
+        print("Saving to cache...")
+        pages_to_save = []
         for page in result.markdown.pages:
+            pages_to_save.append({
+                "text": page.markdown,
+                "metadata": {
+                    "file_name": filename,
+                    "page": page.page_number
+                }
+            })
+
             documents.append(
                 Document(
                     text=page.markdown,
@@ -94,6 +122,9 @@ async def parse_documents_with_llamaparse(data_dir: str):
                     }
                 )
             )
+
+        with open(cache_file, "w") as f:
+            json.dump(pages_to_save, f)
 
     return documents
 
