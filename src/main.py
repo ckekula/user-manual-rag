@@ -3,13 +3,19 @@ import sys
 import json
 import asyncio
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> 8570ef9 (Add image extraction and downloading)
 import re
 import fitz  # PyMuPDF
 
 
 from ast import literal_eval
+<<<<<<< HEAD
 =======
 >>>>>>> b12a9e2 (Update full pipeline with hybrid search and reranking)
+=======
+>>>>>>> 8570ef9 (Add image extraction and downloading)
 from dotenv import load_dotenv
 
 # LlamaIndex
@@ -45,11 +51,18 @@ CACHE_DIR = "./parsed_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 IMAGE_DIR = "../parsed_images"
 os.makedirs(IMAGE_DIR, exist_ok=True)
 
 client = AsyncLlamaCloud(api_key=os.getenv("LLAMA_CLOUD_API_KEY"))
 =======
+=======
+IMAGE_DIR = "../parsed_images"
+os.makedirs(IMAGE_DIR, exist_ok=True)
+
+
+>>>>>>> 8570ef9 (Add image extraction and downloading)
 load_dotenv()
 LLAMA_CLOUD_API_KEY = os.getenv("LLAMA_CLOUD_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -226,7 +239,11 @@ async def parse_documents_with_llamaparse(data_dir: str):
     return documents
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 =======
+=======
+
+>>>>>>> 8570ef9 (Add image extraction and downloading)
 def chunk_document(documents):
     if os.path.exists("./storage"):
         print("Loading index from storage...")
@@ -297,6 +314,9 @@ async def main():
         "What is the name of this device?"
     )
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> 8570ef9 (Add image extraction and downloading)
 
     images = []
 
@@ -308,8 +328,11 @@ async def main():
 
     print("Answer:", response)
     print("Relevant images:", images)
+<<<<<<< HEAD
     print(response)
 =======
+=======
+>>>>>>> 8570ef9 (Add image extraction and downloading)
     print(llm_response.response)
 >>>>>>> b12a9e2 (Update full pipeline with hybrid search and reranking)
 
