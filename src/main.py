@@ -2,6 +2,10 @@ import os
 import sys
 import json
 import asyncio
+import re
+import fitz  # PyMuPDF
+
+
 from ast import literal_eval
 from dotenv import load_dotenv
 from llama_index.core import (
@@ -33,6 +37,9 @@ load_dotenv()
 CACHE_DIR = "../parsed_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
+IMAGE_DIR = "../parsed_images"
+os.makedirs(IMAGE_DIR, exist_ok=True)
+
 client = AsyncLlamaCloud(api_key=os.getenv("LLAMA_CLOUD_API_KEY"))
 
 # initialize the LLM and embedding model
@@ -51,6 +58,65 @@ elif os.getenv("APP_ENV") == "prod":
 Settings.llm = llm
 Settings.embed_model = embed_model
 
+
+#Download and save images
+def extract_images_from_pdf(pdf_path):
+    doc = fitz.open(pdf_path)
+
+    for page_index in range(len(doc)):
+        page = doc[page_index]
+        image_list = page.get_images(full=True)
+
+        for img_index, img in enumerate(image_list):
+            xref = img[0]
+            base_image = doc.extract_image(xref)
+            image_bytes = base_image["image"]
+
+            image_name = f"page_{page_index+1}_img_{img_index}.png"
+            image_path = os.path.join(IMAGE_DIR, image_name)
+
+            with open(image_path, "wb") as f:
+                f.write(image_bytes)
+
+            print(f"Saved {image_name}")
+
+def get_images_for_page(page_number):
+    return [
+        f for f in os.listdir(IMAGE_DIR)
+        if f.startswith(f"page_{page_number}_")
+    ]
+
+async def download_images(result):
+    """Download images using presigned URLs from images_content_metadata."""
+    if not result.images_content_metadata:
+        print("  No image metadata found in result.")
+        return
+
+    import httpx
+    async with httpx.AsyncClient() as http:
+        for img_meta in result.images_content_metadata:
+            # skip non-image metadata items (e.g. total_count)
+            if not hasattr(img_meta, 'filename') or not hasattr(img_meta, 'presigned_url'):
+                continue
+            
+            img_name = img_meta.filename
+            url = img_meta.presigned_url
+
+            if not img_name or not url:
+                continue
+
+            dest = os.path.join(IMAGE_DIR, img_name)
+            if os.path.exists(dest):
+                continue
+            try:
+                print(f"  Downloading {img_name}...")
+                response = await http.get(url)
+                response.raise_for_status()
+                with open(dest, "wb") as f:
+                    f.write(response.content)
+            except Exception as e:
+                print(f"  Warning: could not download {img_name}: {e}")
+
 # parse PDF
 async def parse_documents_with_llamaparse(data_dir: str):
     documents = []
@@ -67,17 +133,17 @@ async def parse_documents_with_llamaparse(data_dir: str):
             with open(cache_file, "r") as f:
                 pages = json.load(f)
 
+            # warn about any images referenced but missing on disk
             for page in pages:
-                documents.append(
-                    Document(
-                        text=page["text"],
-                        metadata=page["metadata"]
-                    )
-                )
+                pass  # images handled by metadata + PDF extraction already
+
+            for page in pages:
+                documents.append(Document(text=page["text"], metadata=page["metadata"]))
             continue
 
         # parse normally
         file_path = os.path.join(data_dir, filename)
+        extract_images_from_pdf(file_path)
 
         print(f"Uploading {filename} to LlamaCloud...")
         file_obj = await client.files.create(
@@ -88,7 +154,7 @@ async def parse_documents_with_llamaparse(data_dir: str):
         print("Parsing file...")
         result = await client.parsing.parse(
             file_id=file_obj.id,
-            tier="cost_effective",
+            tier="agentic",  
             version="latest",
             agentic_options={
                 "custom_prompt": "This is an equipment manual..."
@@ -97,9 +163,9 @@ async def parse_documents_with_llamaparse(data_dir: str):
                 "markdown": {
                     "tables": {"output_tables_as_markdown": True},
                 },
-                "images_to_save": ["embedded"],
+                "images_to_save": ["embedded", "screenshot"],  
             },
-            expand=["markdown"]
+            expand=["markdown", "images_content_metadata"]
         )
 
         print("Saving to cache...")
@@ -113,20 +179,27 @@ async def parse_documents_with_llamaparse(data_dir: str):
                 }
             })
 
-            documents.append(
-                Document(
-                    text=page.markdown,
-                    metadata={
-                        "file_name": filename,
-                        "page": page.page_number
-                    }
-                )
-            )
+        # download images before saving cache
+        await download_images(result)
 
         with open(cache_file, "w") as f:
             json.dump(pages_to_save, f)
 
+        # build documents from saved pages
+        for page in pages_to_save:
+            documents.append(
+            Document(
+                text=page["text"],
+                metadata={
+                    "file_name": filename,
+                    "page": page["metadata"]["page"],
+                    "images": get_images_for_page(page["metadata"]["page"])  # 🔥 ADD
+                }
+                )
+            )
+
     return documents
+
 
 async def main():
     documents = await parse_documents_with_llamaparse("../data")
@@ -157,6 +230,17 @@ async def main():
     response = await query_engine.aquery(
         "What is the name of this device?"
     )
+
+    images = []
+
+    for node in response.source_nodes:
+        imgs = node.metadata.get("images", [])
+        images.extend(imgs)
+
+    images = list(set(images))
+
+    print("Answer:", response)
+    print("Relevant images:", images)
     print(response)
 
 if __name__ == "__main__":
