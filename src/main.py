@@ -2,22 +2,26 @@ import os
 import sys
 import json
 import asyncio
-from ast import literal_eval
 from dotenv import load_dotenv
+
+# LlamaIndex
+from llama_index.retrievers.bm25 import BM25Retriever
+from llama_index.core.retrievers import QueryFusionRetriever
+from llama_index.core.query_engine import RetrieverQueryEngine
+from llama_index.postprocessor.cohere_rerank import CohereRerank
 from llama_index.core import (
     Document,
     VectorStoreIndex,
     StorageContext,
-    PromptTemplate,
     load_index_from_storage,
     set_global_handler
 )
 from llama_index.llms.vllm import Vllm
-from llama_index.llms.google_genai import GoogleGenAI
+from llama_index.llms.groq import Groq
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.core.settings import Settings
+from llama_index.core.llms import ChatMessage
 from llama_cloud import AsyncLlamaCloud
 
 # logging
@@ -29,22 +33,35 @@ logging.getLogger("llama_index.core").setLevel(logging.WARNING)
 logging.getLogger("fsspec").setLevel(logging.WARNING)
 set_global_handler("simple")
 
-load_dotenv()
-CACHE_DIR = "../parsed_cache"
+CACHE_DIR = "./parsed_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-client = AsyncLlamaCloud(api_key=os.getenv("LLAMA_CLOUD_API_KEY"))
+load_dotenv()
+LLAMA_CLOUD_API_KEY = os.getenv("LLAMA_CLOUD_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+COHERE_API_KEY = os.getenv("COHERE_API_KEY")
+
+llama_cloud_client = AsyncLlamaCloud(api_key=LLAMA_CLOUD_API_KEY)
+CHUNK_SIZE = 256
+CHUNK_OVERLAP = 50
+DEV_EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+PROD_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"
+DEV_LLM_MODEL = "qwen/qwen3-32b"
+PROD_LLM_MODEL = "Qwen3.5-122B-A10B-GGUF"
 
 # initialize the LLM and embedding model
 if os.getenv("APP_ENV") == "dev":
-    embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-small-en-v1.5")
-    llm = GoogleGenAI(model="gemini-2.5-flash-lite")
+    embed_model = HuggingFaceEmbedding(model_name=DEV_EMBEDDING_MODEL)
+    llm = Groq(
+        model=DEV_LLM_MODEL,
+        api_key=GROQ_API_KEY
+    )
 elif os.getenv("APP_ENV") == "prod":
-    embed_model = HuggingFaceEmbedding(model_name="Qwen/Qwen3-Embedding-0.6B")
+    embed_model = HuggingFaceEmbedding(model_name=PROD_EMBEDDING_MODEL)
     llm = Vllm(
-        model="Qwen3.5-122B-A10B-GGUF",
+        model=PROD_LLM_MODEL,
         tensor_parallel_size=4,
-        max_new_tokens=100,
+        max_new_tokens=512,
         vllm_kwargs={"swap_space": 1, "gpu_memory_utilization": 0.5},
     )
 
@@ -80,13 +97,13 @@ async def parse_documents_with_llamaparse(data_dir: str):
         file_path = os.path.join(data_dir, filename)
 
         print(f"Uploading {filename} to LlamaCloud...")
-        file_obj = await client.files.create(
+        file_obj = await llama_cloud_client.files.create(
             file=file_path,
             purpose="parse"
         )
 
         print("Parsing file...")
-        result = await client.parsing.parse(
+        result = await llama_cloud_client.parsing.parse(
             file_id=file_obj.id,
             tier="cost_effective",
             version="latest",
@@ -128,36 +145,75 @@ async def parse_documents_with_llamaparse(data_dir: str):
 
     return documents
 
+def chunk_document(documents):
+    if os.path.exists("./storage"):
+        print("Loading index from storage...")
+        storage_context = StorageContext.from_defaults(persist_dir="./storage")
+        index = load_index_from_storage(storage_context)
+        nodes = list(index.docstore.docs.values())
+        print("Done")
+    else:
+        splitter = SentenceSplitter(
+            chunk_size=CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP
+        )
+
+        print("Chunking documents into nodes...")
+        nodes = splitter.get_nodes_from_documents(documents)
+
+        print("Creating new index...")
+        index = VectorStoreIndex.from_documents(nodes)
+        index.storage_context.persist("./storage")
+        print("Done")
+    
+    return index, nodes
+
+def hybrid_search(index, nodes):
+    # Build retrievers
+    dense_retriever = index.as_retriever(similarity_top_k=10)
+
+    bm25_retriever = BM25Retriever.from_defaults(
+        nodes=nodes,
+        similarity_top_k=10,
+    )
+
+    # Hybrid retriever
+    hybrid_retriever = QueryFusionRetriever(
+        [dense_retriever, bm25_retriever],
+        similarity_top_k=10,
+        num_queries=1,
+        mode="reciprocal_rerank",
+    )
+
+    return hybrid_retriever
+
+
 async def main():
     documents = await parse_documents_with_llamaparse("../data")
 
-    print("Chunking documents into nodes...")
-    splitter = SentenceSplitter(chunk_size=512, chunk_overlap=50)
-    nodes = splitter.get_nodes_from_documents(documents)
+    index, nodes = chunk_document(documents)
 
-    # index
-    if os.path.exists("../storage"):
-        print("Loading index from storage...")
-        storage_context = StorageContext.from_defaults(persist_dir="../storage")
-        index = load_index_from_storage(storage_context)
-    else:
-        print("Creating new index...")
-        index = VectorStoreIndex(nodes)
-        index.storage_context.persist("../storage")
+    hybrid_retriever = hybrid_search(index, nodes)
 
-    retriever = index.as_retriever(similarity_top_k=5)
+    # Cohere reranker — returns top 5 after reranking the 20 candidates
+    cohere_rerank = CohereRerank(
+        api_key=COHERE_API_KEY,
+        top_n=5,
+    )
 
+    # Query engine with hybrid retrieval + reranking
     print("Querying the index...")
     query_engine = RetrieverQueryEngine.from_args(
-        retriever,
-        llm=llm
+        hybrid_retriever,
+        llm=llm,
+        node_postprocessors=[cohere_rerank],
     )
 
     print("Generating response...")
-    response = await query_engine.aquery(
+    llm_response = await query_engine.aquery(
         "What is the name of this device?"
     )
-    print(response)
+    print(llm_response.response)
 
 if __name__ == "__main__":
     asyncio.run(main())
