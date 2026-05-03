@@ -2,3 +2,5 @@
 .env
 /storage
 *.egg-info/
+/node_modules
+/parsed_images
