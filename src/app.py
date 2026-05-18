@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
+from fastapi import Request
 from pydantic import BaseModel
 import os
 from fastapi.middleware.cors import CORSMiddleware
@@ -128,46 +129,63 @@ def clean_llm_output(text: str) -> str:
 # Query endpoint: query the RAG pipeline and return answer + sources + image info
 # ---------------------------
 @app.post("/query")
-async def query_rag(req: QueryRequest):
+async def query_rag(req: QueryRequest, request: Request):
     if query_engine is None:
         return JSONResponse(status_code=503, content={"error": "Pipeline not ready"})
 
     response = await query_engine.aquery(req.query)
+    base_url = str(request.base_url).rstrip("/")
 
-    images = []
-    has_tables = False
-    has_images = False
+    tables = []
     sources = []
+    matched_pages = set()  # ← collect pages from text nodes
 
     for node in response.source_nodes:
-        # images
-        node_images = node.metadata.get("images", [])
-        images.extend(node_images)
+        node_type = node.metadata.get("type")
 
-        # detect tables and images
-        text = node.get_content()
-        if "|" in text and "---" in text:
-            has_tables = True
-        if node_images:
-            has_images = True
+        if node_type == "table":
+            markdown = node.metadata.get("table_markdown")
+            if markdown:
+                tables.append(markdown)
 
-        # sources
-        sources.append({
-            "file_name": node.metadata.get("file_name", ""),
-            "page": node.metadata.get("page", ""),
-            "snippet": node.get_content()[:150],
-            "score": round(node.score, 3) if node.score else None,
-        })
+        else:
+            # text node — record the page number
+            page = node.metadata.get("page")
+            if page is not None:
+                matched_pages.add(int(page))
 
-    images = list(set(images))
+            sources.append({
+                "file_name": node.metadata.get("file_name", ""),
+                "page": page,
+                "snippet": node.get_content()[:150],
+                "score": round(node.score, 3) if node.score else None,
+            })
+
+    # Find all images whose filename page number is in matched_pages
+    images = []
+    if os.path.exists(IMAGE_DIR):
+        for img_name in os.listdir(IMAGE_DIR):
+            if not img_name.endswith(".png"):
+                continue
+            # filename format: page_22_img_0.png → extract 22
+            try:
+                page_num = int(img_name.split("_")[1])
+            except (IndexError, ValueError):
+                continue
+            if page_num in matched_pages:
+                images.append(f"{base_url}/images/{img_name}")
+
+    images = sorted(set(images))
+    tables = list(dict.fromkeys(tables))
     raw_answer = str(response)
     clean_answer = clean_llm_output(raw_answer)
 
     return JSONResponse(content={
         "answer": clean_answer,
         "images": images,
-        "has_tables": has_tables,
-        "has_images": has_images,
+        "tables": tables,
+        "has_images": len(images) > 0,
+        "has_tables": len(tables) > 0,
         "sources": sources,
     })
 
