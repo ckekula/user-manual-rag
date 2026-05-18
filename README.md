@@ -20,3 +20,14 @@ LLAMA_CLOUD_API_KEY = "your_api_key"
 ```
 
 4. Run the notebook
+
+5. Run app.py
+```
+uvicorn app:app --reload
+```
+
+6. Run frontend
+ ```
+ npm run dev
+ ```
+
