@@ -52,13 +52,46 @@ query_engine = None
 async def build_pipeline():
     global query_engine
 
-    documents = await parse_documents_with_llamaparse(DATA_DIR)
+    from llama_index.postprocessor.cohere_rerank import CohereRerank
+    from main import (
+        parse_documents_with_llamaparse,
+        llm,
+        hybrid_search,
+        chunk_document,
+        build_image_metadata_store,
+        build_image_documents,
+        build_table_metadata_store,
+        build_table_documents,
+        IMAGE_DIR,
+    )
 
+    COHERE_API_KEY = os.getenv("COHERE_API_KEY")
+
+    # Parse documents
+    documents, all_tables_map = await parse_documents_with_llamaparse(DATA_DIR)
+
+    # Build image docs
+    image_metadata = await build_image_metadata_store(IMAGE_DIR)
+    image_docs = build_image_documents(image_metadata)
+    documents.extend(image_docs)
+
+    # Build table docs
+    for filename, tables_map in all_tables_map.items():
+        table_records = await build_table_metadata_store(tables_map, filename)
+        table_docs = build_table_documents(table_records)
+        documents.extend(table_docs)
+
+    # Build index
     index, nodes = chunk_document(documents)
 
     hybrid_retriever = hybrid_search(index, nodes)
 
-    cohere_rerank = CohereRerank(api_key=COHERE_API_KEY, top_n=5)
+    cohere_rerank = CohereRerank(
+        api_key=COHERE_API_KEY,
+        top_n=5,
+    )
+
+    from llama_index.core.query_engine import RetrieverQueryEngine
 
     query_engine = RetrieverQueryEngine.from_args(
         hybrid_retriever,
@@ -67,7 +100,6 @@ async def build_pipeline():
     )
 
     print("RAG pipeline ready.")
-
 
 # ---------------------------
 # Upload: save file and rebuild pipeline
