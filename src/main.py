@@ -1,7 +1,8 @@
+# main.py
+import asyncio
 import os
 import sys
 import json
-import asyncio
 import base64
 import fitz  
 import pdfplumber
@@ -12,8 +13,6 @@ from dotenv import load_dotenv
 # LlamaIndex
 from llama_index.retrievers.bm25 import BM25Retriever
 from llama_index.core.retrievers import QueryFusionRetriever
-from llama_index.core.query_engine import RetrieverQueryEngine
-from llama_index.postprocessor.cohere_rerank import CohereRerank
 from llama_index.core import (
     Document,
     VectorStoreIndex,
@@ -26,7 +25,6 @@ from llama_index.llms.groq import Groq
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.core.settings import Settings
-from llama_index.core.llms import ChatMessage
 from llama_cloud import AsyncLlamaCloud
 
 # logging
@@ -48,7 +46,6 @@ os.makedirs(IMAGE_DIR, exist_ok=True)
 load_dotenv()
 LLAMA_CLOUD_API_KEY = os.getenv("LLAMA_CLOUD_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-COHERE_API_KEY = os.getenv("COHERE_API_KEY")
 
 llama_cloud_client = AsyncLlamaCloud(api_key=LLAMA_CLOUD_API_KEY)
 CHUNK_SIZE = 256
@@ -73,6 +70,8 @@ elif os.getenv("APP_ENV") == "prod":
         max_new_tokens=512,
         vllm_kwargs={"swap_space": 1, "gpu_memory_utilization": 0.5},
     )
+else:
+    raise ValueError("Invalid APP_ENV. Please set it to 'dev' or 'prod'.")
 
 Settings.llm = llm
 Settings.embed_model = embed_model
@@ -147,7 +146,7 @@ async def build_image_metadata_store(image_dir: str) -> dict:
         img_path = os.path.join(image_dir, img_name)
         print(f"  Describing {img_name}...")
         try:
-            description = await describe_image_with_llm(img_path)
+            description = await asyncio.gather(describe_image_with_llm(img_path))
         except Exception as e:
             print(f"  Warning: could not describe {img_name}: {e}")
             description = "Unknown image content"
@@ -259,7 +258,7 @@ async def build_table_metadata_store(tables_map: dict, filename: str) -> list:
         for idx, markdown_table in enumerate(tables):
             print(f"  Summarizing table page {page_num} #{idx}...")
             try:
-                summary = await summarize_table_with_llm(markdown_table)
+                summary = await asyncio.gather(summarize_table_with_llm(markdown_table))
             except Exception as e:
                 print(f"  Warning: could not summarize table p{page_num}#{idx}: {e}")
                 summary = "A table from the equipment manual."
@@ -382,8 +381,6 @@ def extract_tables_from_pdf(pdf_path):
             for table in page_tables:
                 if not table or not table[0]:
                     continue
-                # Use our normalizer instead of df.to_markdown() which
-                # breaks when cells contain newlines or pipe characters
                 formatted_tables.append(rows_to_markdown(table[0], table[1:]))
             tables_per_page[i + 1] = formatted_tables
     return tables_per_page
@@ -412,26 +409,50 @@ def split_markdown_by_section(markdown_text):
 
 async def parse_documents_with_llamaparse(data_dir: str):
     documents = []
-    all_tables_map = {}   # { filename: { page_num: [markdown, ...] } }
+    all_tables_map = {}
 
     for filename in os.listdir(data_dir):
         if not filename.endswith(".pdf"):
             continue
 
         cache_file = os.path.join(CACHE_DIR, f"{filename}.json")
+        tables_cache_file = os.path.join(CACHE_DIR, f"{filename}.tables_map.json")  # new
 
         if os.path.exists(cache_file):
             print(f"Loading cached parse for {filename}...")
             with open(cache_file, "r") as f:
                 pages = json.load(f)
+
+            # Reconstruct documents with section splitting, same as fresh parse
             for page in pages:
-                documents.append(Document(text=page["text"], metadata=page["metadata"]))
+                page_num = page["metadata"]["page"]
+                sections = split_markdown_by_section(page["text"])
+                for section_title, section_text in sections:
+                    documents.append(Document(
+                        text=section_text,
+                        metadata={
+                            "file_name": filename,
+                            "page": page_num,
+                            "section": section_title,
+                            "type": "text",
+                        }
+                    ))
+
+            # Load tables_map from its own cache
+            if os.path.exists(tables_cache_file):
+                with open(tables_cache_file, "r") as f:
+                    all_tables_map[filename] = json.load(f)
+
             continue
 
         file_path = os.path.join(data_dir, filename)
         extract_images_from_pdf(file_path)
         tables_map = extract_tables_from_pdf(file_path)
         all_tables_map[filename] = tables_map
+
+        # Cache the tables_map
+        with open(tables_cache_file, "w") as f:
+            json.dump(tables_map, f)
 
         print(f"Uploading {filename} to LlamaCloud...")
         file_obj = await llama_cloud_client.files.create(
@@ -495,72 +516,32 @@ async def parse_documents_with_llamaparse(data_dir: str):
 
     return documents, all_tables_map
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# INDEXING & RETRIEVAL  (unchanged)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def chunk_document(documents):
-    if os.path.exists("./storage"):
-        print("Loading index from storage...")
-        storage_context = StorageContext.from_defaults(persist_dir="./storage")
-        index = load_index_from_storage(storage_context)
-        nodes = list(index.docstore.docs.values())
-        print("Done")
-    else:
-        splitter = SentenceSplitter(
-            chunk_size=CHUNK_SIZE,
-            chunk_overlap=CHUNK_OVERLAP
-        )
-        print("Chunking documents into nodes...")
-        nodes = splitter.get_nodes_from_documents(documents)
-        print("Creating new index...")
-        index = VectorStoreIndex.from_documents(nodes)
-        index.storage_context.persist("./storage")
-        print("Done")
-    return index, nodes
-
-
-def hybrid_search(index, nodes):
-    dense_retriever = index.as_retriever(similarity_top_k=10)
-    bm25_retriever = BM25Retriever.from_defaults(
-        nodes=nodes,
-        similarity_top_k=10,
-    )
-    hybrid_retriever = QueryFusionRetriever(
-        [dense_retriever, bm25_retriever],
-        similarity_top_k=10,
-        num_queries=1,
-        mode="reciprocal_rerank",
-    )
-    return hybrid_retriever
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 
-def chunk_document(documents):
-    if os.path.exists("./storage"):
+def chunk_document(documents=None):
+    if documents is None and os.path.exists("./storage"):
         print("Loading index from storage...")
         storage_context = StorageContext.from_defaults(persist_dir="./storage")
         index = load_index_from_storage(storage_context)
         nodes = list(index.docstore.docs.values())
         print("Done")
-    else:
-        splitter = SentenceSplitter(
-            chunk_size=CHUNK_SIZE,
-            chunk_overlap=CHUNK_OVERLAP
-        )
+        return index, nodes
 
-        print("Chunking documents into nodes...")
-        nodes = splitter.get_nodes_from_documents(documents)
+    if documents is None:
+        raise ValueError("No documents provided and no storage found.")
 
-        print("Creating new index...")
-        index = VectorStoreIndex.from_documents(nodes)
-        index.storage_context.persist("./storage")
-        print("Done")
+    splitter = SentenceSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
     
+    print("Chunking documents into nodes...")
+    nodes = splitter.get_nodes_from_documents(documents)
+    
+    print("Creating new index...")
+    index = VectorStoreIndex.from_documents(nodes)
+    index.storage_context.persist("./storage")
+    print("Done")
+
     return index, nodes
 
 def hybrid_search(index, nodes):
@@ -581,72 +562,3 @@ def hybrid_search(index, nodes):
     )
 
     return hybrid_retriever
-
-
-async def main():
-    # 1. Parse text documents (tables_map returned separately)
-    documents, all_tables_map = await parse_documents_with_llamaparse("../data")
-
-    # 2. Build semantic image metadata (described once, cached forever)
-    image_metadata = await build_image_metadata_store(IMAGE_DIR)
-    image_docs = build_image_documents(image_metadata)
-    documents.extend(image_docs)
-
-    # 3. Build semantic table metadata (summarized once, cached forever)
-    for filename, tables_map in all_tables_map.items():
-        table_records = await build_table_metadata_store(tables_map, filename)
-        table_docs = build_table_documents(table_records)
-        documents.extend(table_docs)
-
-    # 4. Chunk + index everything (text, image descriptions, table summaries)
-    index, nodes = chunk_document(documents)
-
-    # 5. Hybrid retrieval
-    hybrid_retriever = hybrid_search(index, nodes)
-
-    # 6. Cohere reranker
-    cohere_rerank = CohereRerank(
-        api_key=COHERE_API_KEY,
-        top_n=5,
-    )
-
-    # 7. Query
-    print("Querying the index...")
-    query_engine = RetrieverQueryEngine.from_args(
-        hybrid_retriever,
-        llm=llm,
-        node_postprocessors=[cohere_rerank],
-    )
-
-    print("Generating response...")
-    llm_response = await query_engine.aquery(
-        "What is the name of this device?"
-    )
-
-    # 8. Collect results
-    #    - image nodes  → surface image_path from metadata
-    #    - table nodes  → surface table_markdown from metadata (NOT node.text which is just the summary)
-    images = []
-    tables = []
-
-    for node in llm_response.source_nodes[:5]:
-        node_type = node.metadata.get("type")
-
-        if node_type == "image":
-            images.append(node.metadata.get("image_path"))
-        elif node_type == "table":
-            tables.append(node.metadata.get("table_markdown"))  # raw markdown for display
-
-    images = list(set(filter(None, images)))
-    tables = list(set(filter(None, tables)))
-
-    print("Answer:", llm_response.response)
-    print("Relevant images:", images)
-    print("\nRelevant tables:\n")
-    for t in tables:
-        print(t)
-        print("-" * 40)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())

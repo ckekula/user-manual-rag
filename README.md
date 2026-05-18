@@ -13,15 +13,16 @@ uv venv --python 3.12.12
 uv sync
 ```
 
-3. Create .env file and add Llama Cloud and Google API Keys
+3. Create .env file and add API Keys
 ```
-GOOGLE_API_KEY="your_api_key"
-LLAMA_CLOUD_API_KEY = "your_api_key"
+APP_ENV=dev
+GOOGLE_API_KEY=
+LLAMA_CLOUD_API_KEY=
+GROQ_API_KEY=
+COHERE_API_KEY=
 ```
 
-4. Run the notebook
-
-5. Run app.py
+4. Run app.py
 ```
 uvicorn app:app --reload
 ```
@@ -30,4 +31,3 @@ uvicorn app:app --reload
  ```
  npm run dev
  ```
-

@@ -1,5 +1,7 @@
+# app.py
 import os
 import re
+import shutil
 
 from fastapi import FastAPI
 from fastapi.concurrency import asynccontextmanager
@@ -11,24 +13,30 @@ from pydantic import BaseModel
 
 from llama_index.postprocessor.cohere_rerank import CohereRerank
 from llama_index.core.query_engine import RetrieverQueryEngine
-from main import parse_documents_with_llamaparse, llm, hybrid_search, chunk_document
 
-COHERE_API_KEY = os.getenv("COHERE_API_KEY")
+from main import (
+    parse_documents_with_llamaparse,
+    llm,
+    hybrid_search,
+    chunk_document,
+    build_image_metadata_store,
+    build_image_documents,
+    build_table_metadata_store,
+    build_table_documents,
+    IMAGE_DIR,
+    COHERE_API_KEY,
+)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup logic
-    print("Starting up...")
-
+    if os.path.exists(DATA_DIR) and any(f.endswith(".pdf") for f in os.listdir(DATA_DIR)):
+        await build_pipeline()
     yield
-
-    # Shutdown logic
     print("Shutting down...")
 
 app = FastAPI(lifespan=lifespan)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-IMAGE_DIR = os.path.join(BASE_DIR, "../parsed_images")
 DATA_DIR = os.path.join(BASE_DIR, "../data")
 
 app.mount("/images", StaticFiles(directory=IMAGE_DIR), name="images")
@@ -51,21 +59,6 @@ query_engine = None
 # ---------------------------
 async def build_pipeline():
     global query_engine
-
-    from llama_index.postprocessor.cohere_rerank import CohereRerank
-    from main import (
-        parse_documents_with_llamaparse,
-        llm,
-        hybrid_search,
-        chunk_document,
-        build_image_metadata_store,
-        build_image_documents,
-        build_table_metadata_store,
-        build_table_documents,
-        IMAGE_DIR,
-    )
-
-    COHERE_API_KEY = os.getenv("COHERE_API_KEY")
 
     # Parse documents
     documents, all_tables_map = await parse_documents_with_llamaparse(DATA_DIR)
@@ -113,7 +106,6 @@ async def upload_pdf(file: UploadFile = File(...)):
     print(f"Saved {file.filename}, rebuilding pipeline...")
 
     # Clear storage cache so chunk_document re-indexes with new file
-    import shutil
     storage_path = os.path.join(BASE_DIR, "./storage")
     if os.path.exists(storage_path):
         shutil.rmtree(storage_path)
