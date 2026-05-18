@@ -1,0 +1,10 @@
+chunk_size: 256
+chunk_overlap: 50
+
+retriever:
+  similarity_top_k: 10
+  num_queries: 1
+  mode: "reciprocal_rerank"
+
+reranker:
+  top_n: 5
