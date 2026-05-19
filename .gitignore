@@ -4,6 +4,6 @@
 /storage
 /node_modules
 /parsed_images
-__pycache__/
+*.pyc
 processed/
 vectordb

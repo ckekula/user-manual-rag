@@ -11,6 +11,7 @@ Handles all document ingestion:
 
 import os
 import asyncio
+from pathlib import Path
 
 import pymupdf
 import httpx
@@ -43,16 +44,16 @@ llama_cloud_client = AsyncLlamaCloud(api_key=LLAMA_CLOUD_API_KEY)
 def extract_images_from_pdf(pdf_path: str) -> None:
     """Save every embedded image from *pdf_path* into IMAGE_DIR."""
     doc = pymupdf.open(pdf_path)
+    stem = Path(pdf_path).stem
     for page_index in range(len(doc)):
         page = doc[page_index]
         for img_index, img in enumerate(page.get_images(full=True)):
             xref = img[0]
             base_image = doc.extract_image(xref)
-            image_name = f"page_{page_index + 1}_img_{img_index}.png"
+            image_name = f"{stem}_page_{page_index + 1}_img_{img_index}.png"
             image_path = IMAGE_DIR / image_name
             with open(image_path, "wb") as f:
                 f.write(base_image["image"])
-            print(f"  Saved {image_name}")
 
 
 async def _download_images(result) -> None:
@@ -89,20 +90,19 @@ async def build_image_metadata_store() -> dict:
         { "page_1_img_0.png": {"path": ..., "description": ..., "page": ...}, ... }
     """
     cache_file = PROCESSED_DIR / "image_metadata.json"
-    cached = read_json_cache(cache_file)
-    if cached is not None:
-        print("Loading image metadata from cache...")
-        return cached
+    image_metadata = read_json_cache(cache_file) or {}
 
-    image_metadata: dict = {}
     image_files = sorted(f for f in os.listdir(IMAGE_DIR) if f.endswith(".png"))
+    new_files = [f for f in image_files if f not in image_metadata]
 
-    for img_name in image_files:
+    if not new_files:
+        return image_metadata
+
+    # Describe new images in parallel
+    async def _describe(img_name: str):
         img_path = str(IMAGE_DIR / img_name)
-        print(f"  Describing {img_name}...")
         try:
-            descriptions = await asyncio.gather(describe_image(img_path))
-            description = descriptions[0]
+            description = await describe_image(img_path)
         except Exception as e:
             print(f"  Warning: could not describe {img_name}: {e}")
             description = "Unknown image content"
@@ -111,15 +111,12 @@ async def build_image_metadata_store() -> dict:
             page_num = int(img_name.split("_")[1])
         except (IndexError, ValueError):
             page_num = -1
+        return img_name, {"path": img_path, "description": description, "page": page_num}
 
-        image_metadata[img_name] = {
-            "path": img_path,
-            "description": description,
-            "page": page_num,
-        }
+    results = await asyncio.gather(*[_describe(f) for f in new_files])
+    image_metadata.update(dict(results))
 
     write_json_cache(cache_file, image_metadata)
-    print(f"  Saved descriptions for {len(image_metadata)} images.")
     return image_metadata
 
 
@@ -175,7 +172,7 @@ async def build_table_metadata_store(tables_map: dict, filename: str) -> list[di
         for idx, markdown_table in enumerate(tables):
             print(f"  Summarizing table page {page_num} #{idx}...")
             try:
-                summaries = await asyncio.gather(summarize_table(markdown_table))
+                summaries = await summarize_table(markdown_table)
                 summary = summaries[0]
             except Exception as e:
                 print(f"  Warning: could not summarize table p{page_num}#{idx}: {e}")
@@ -297,6 +294,8 @@ def _append_section_docs(
 ) -> None:
     """Split markdown into sections and append one Document per section."""
     for section_title, section_text in split_markdown_by_section(markdown_text):
+        if not section_text.strip():
+            continue  # skip empty sections
         documents.append(
             Document(
                 text=section_text,

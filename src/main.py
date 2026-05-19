@@ -6,7 +6,7 @@ Owns the lifespan, pipeline orchestration, and HTTP endpoints (/upload, /query, 
 import os
 
 from fastapi import FastAPI, UploadFile, File
-from fastapi.concurrency import asynccontextmanager
+from contextlib import asynccontextmanager
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -54,23 +54,27 @@ _index = None # /upload can insert without rebuilding from scratch
 async def _build_pipeline() -> None:
     global _query_engine, _index
 
-    # 1. Parse text documents
-    documents, all_tables_map = await parse_documents()
+    docstore_file = VECTOR_DIR / "docstore.json"
+    if docstore_file.exists():
+        print("Found existing index, loading from Qdrant + docstore...")
+        _index, nodes = build_index()  # load path — no re-embedding
+    else:
+        # 1. Parse text documents
+        documents, all_tables_map = await parse_documents()
 
-    # 2. Describe images and add as documents
-    image_metadata = await build_image_metadata_store()
-    documents.extend(build_image_documents(image_metadata))
+        # 2. Describe images and add as documents
+        image_metadata = await build_image_metadata_store()
+        documents.extend(build_image_documents(image_metadata))
 
-    # 3. Summarize tables and add as documents
-    for filename, tables_map in all_tables_map.items():
-        table_records = await build_table_metadata_store(tables_map, filename)
-        documents.extend(build_table_documents(table_records))
+        # 3. Summarize tables and add as documents
+        for filename, tables_map in all_tables_map.items():
+            table_records = await build_table_metadata_store(tables_map, filename)
+            documents.extend(build_table_documents(table_records))
 
-    # 4. Build vector index
-    _index, _ = build_index(documents)
+        # 4. Build vector index
+        _index, nodes = build_index(documents)
 
-    # 5. Assemble query engine (nodes fetched from live docstore)
-    nodes = get_all_nodes(_index)
+    # Assemble query engine
     _query_engine = build_query_engine(_index, nodes)
 
     print("RAG pipeline ready.")
@@ -127,6 +131,7 @@ async def upload_pdf(file: UploadFile = File(...)):
             insert_nodes(_index, new_nodes)
         else:
             # First-ever upload: build index from scratch with these nodes
+            print("Warning: no docstore found, building fresh index (any existing Qdrant data will be replaced).")
             _index, _ = build_index(new_documents)
 
     # ── Rebuild query engine with the updated node set ────────────────────────
@@ -165,7 +170,7 @@ async def query_rag(req: QueryRequest):
             "file_name": node.metadata.get("file_name", ""),
             "page": node.metadata.get("page", ""),
             "snippet": text[:150],
-            "score": round(node.score, 3) if node.score else None,
+            "score": round(node.score, 3) if node.score is not None else None,
         })
 
     return JSONResponse(content={

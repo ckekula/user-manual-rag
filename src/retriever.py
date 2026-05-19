@@ -129,8 +129,17 @@ def insert_nodes(index: VectorStoreIndex, new_nodes: list, persist: bool = True)
     Separating insertion from index construction keeps main.py's upload
     handler simple and ensures the docstore stays consistent with Qdrant.
     """
-    docstore_path = str(VECTOR_DIR)
 
+    existing_ids = set(index.storage_context.docstore.docs.keys())
+    deduped = [n for n in new_nodes if n.node_id not in existing_ids]
+
+    if not deduped:
+        print("All nodes already indexed, skipping insert.")
+        return
+
+    for node in deduped:
+        index.insert_nodes([node])
+        
     # Add to Qdrant
     for node in new_nodes:
         index.insert_nodes([node])
@@ -139,7 +148,7 @@ def insert_nodes(index: VectorStoreIndex, new_nodes: list, persist: bool = True)
     index.storage_context.docstore.add_documents(new_nodes)
 
     if persist:
-        index.storage_context.persist(docstore_path)
+        index.storage_context.persist(str(VECTOR_DIR))
         print(f"Persisted {len(new_nodes)} new nodes to docstore.")
 
 
