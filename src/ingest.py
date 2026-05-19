@@ -215,7 +215,7 @@ def build_table_documents(table_records: list[dict]) -> list[Document]:
 # PDF parsing via LlamaParse
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def parse_documents(data_dir=None) -> tuple[list[Document], dict]:
+async def parse_documents(data_dir=None, files=None) -> tuple[list[Document], dict]:
     """
     Parse all PDFs in *data_dir* (defaults to RAW_DIR).
 
@@ -229,7 +229,8 @@ async def parse_documents(data_dir=None) -> tuple[list[Document], dict]:
     documents: list[Document] = []
     all_tables_map: dict = {}
 
-    for filename in os.listdir(data_dir):
+    filenames = os.listdir(data_dir) if files is None else files
+    for filename in filenames:
         if not filename.endswith(".pdf"):
             continue
 
@@ -267,7 +268,7 @@ async def parse_documents(data_dir=None) -> tuple[list[Document], dict]:
             agentic_options={"custom_prompt": "This is an equipment manual..."},
             output_options={
                 "markdown": {"tables": {"output_tables_as_markdown": True}},
-                "images_to_save": ["embedded", "screenshot"],
+                "images_to_save": ["embedded"],
             },
             expand=["markdown", "images_content_metadata"],
         )
