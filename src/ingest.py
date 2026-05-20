@@ -11,6 +11,7 @@ Handles all document ingestion:
 
 import os
 import asyncio
+import logging
 from pathlib import Path
 
 import pymupdf
@@ -34,6 +35,8 @@ from src.generator import describe_image, summarize_table
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 LLAMA_CLOUD_API_KEY = os.getenv("LLAMA_CLOUD_API_KEY")
 llama_cloud_client = AsyncLlamaCloud(api_key=LLAMA_CLOUD_API_KEY)
 
@@ -43,6 +46,8 @@ llama_cloud_client = AsyncLlamaCloud(api_key=LLAMA_CLOUD_API_KEY)
 
 def extract_images_from_pdf(pdf_path: str) -> None:
     """Save every embedded image from *pdf_path* into IMAGE_DIR."""
+    logger.info("Extracting embedded images from %s", pdf_path)
+    total_images = 0
     doc = pymupdf.open(pdf_path)
     stem = Path(pdf_path).stem
     for page_index in range(len(doc)):
@@ -54,13 +59,17 @@ def extract_images_from_pdf(pdf_path: str) -> None:
             image_path = IMAGE_DIR / image_name
             with open(image_path, "wb") as f:
                 f.write(base_image["image"])
+                total_images += 1
+            logger.info("Extracted %s images from %s", total_images, pdf_path)
 
 
 async def _download_images(result) -> None:
     """Download images using presigned URLs from LlamaParse result."""
     if not result.images_content_metadata:
+        logger.debug("No image metadata returned by parser")
         return
 
+    downloaded = 0
     async with httpx.AsyncClient() as http:
         for img_meta in result.images_content_metadata:
             if not hasattr(img_meta, "filename") or not hasattr(img_meta, "presigned_url"):
@@ -73,13 +82,15 @@ async def _download_images(result) -> None:
             if dest.exists():
                 continue
             try:
-                print(f"  Downloading {img_name}...")
+                logger.info("Downloading parsed image %s", img_name)
                 response = await http.get(url)
                 response.raise_for_status()
                 with open(dest, "wb") as f:
                     f.write(response.content)
+                downloaded += 1
             except Exception as e:
-                print(f"  Warning: could not download {img_name}: {e}")
+                logger.warning("Could not download %s: %s", img_name, e)
+    logger.info("Downloaded %s parser images", downloaded)
 
 
 async def build_image_metadata_store() -> dict:
@@ -96,7 +107,10 @@ async def build_image_metadata_store() -> dict:
     new_files = [f for f in image_files if f not in image_metadata]
 
     if not new_files:
+        logger.info("Image metadata cache up to date (%s images)", len(image_metadata))
         return image_metadata
+
+    logger.info("Describing %s new images", len(new_files))
 
     # Describe new images in parallel
     async def _describe(img_name: str):
@@ -104,7 +118,7 @@ async def build_image_metadata_store() -> dict:
         try:
             description = await describe_image(img_path)
         except Exception as e:
-            print(f"  Warning: could not describe {img_name}: {e}")
+            logger.warning("Could not describe %s: %s", img_name, e)
             description = "Unknown image content"
 
         try:
@@ -117,6 +131,7 @@ async def build_image_metadata_store() -> dict:
     image_metadata.update(dict(results))
 
     write_json_cache(cache_file, image_metadata)
+    logger.info("Image metadata store updated to %s total entries", len(image_metadata))
     return image_metadata
 
 
@@ -142,7 +157,9 @@ def build_image_documents(image_metadata: dict) -> list[Document]:
 
 def extract_tables_from_pdf(pdf_path: str) -> dict:
     """Return { page_num: [markdown_table, ...], ... } for all pages."""
+    logger.info("Extracting tables from %s", pdf_path)
     tables_per_page: dict = {}
+    total_tables = 0
     with pdfplumber.open(pdf_path) as pdf:
         for i, page in enumerate(pdf.pages):
             formatted_tables = []
@@ -150,7 +167,9 @@ def extract_tables_from_pdf(pdf_path: str) -> dict:
                 if not table or not table[0]:
                     continue
                 formatted_tables.append(rows_to_markdown(table[0], table[1:]))
+                total_tables += 1
             tables_per_page[i + 1] = formatted_tables
+    logger.info("Extracted %s tables from %s", total_tables, pdf_path)
     return tables_per_page
 
 
@@ -163,19 +182,20 @@ async def build_table_metadata_store(tables_map: dict, filename: str) -> list[di
     cache_file = PROCESSED_DIR / f"{filename}.tables.json"
     cached = read_json_cache(cache_file)
     if cached is not None:
-        print(f"  Loading cached table metadata for {filename}...")
+        logger.info("Using cached table metadata for %s (%s records)", filename, len(cached))
         return cached
 
     table_records: list[dict] = []
+    logger.info("Summarizing tables for %s", filename)
 
     for page_num, tables in tables_map.items():
         for idx, markdown_table in enumerate(tables):
-            print(f"  Summarizing table page {page_num} #{idx}...")
+            logger.info("Summarizing table page=%s index=%s for %s", page_num, idx, filename)
             try:
                 summaries = await summarize_table(markdown_table)
                 summary = summaries[0]
             except Exception as e:
-                print(f"  Warning: could not summarize table p{page_num}#{idx}: {e}")
+                logger.warning("Could not summarize table p%s#%s for %s: %s", page_num, idx, filename, e)
                 summary = "A table from the equipment manual."
 
             table_records.append({
@@ -187,7 +207,7 @@ async def build_table_metadata_store(tables_map: dict, filename: str) -> list[di
             })
 
     write_json_cache(cache_file, table_records)
-    print(f"  Saved summaries for {len(table_records)} tables.")
+    logger.info("Saved summaries for %s tables in %s", len(table_records), filename)
     return table_records
 
 
@@ -227,16 +247,19 @@ async def parse_documents(data_dir=None, files=None) -> tuple[list[Document], di
     all_tables_map: dict = {}
 
     filenames = os.listdir(data_dir) if files is None else files
+    logger.info("Starting parse for %s candidate files in %s", len(filenames), data_dir)
     for filename in filenames:
         if not filename.endswith(".pdf"):
             continue
+
+        logger.info("Processing PDF %s", filename)
 
         cache_file = PROCESSED_DIR / f"{filename}.json"
         tables_cache_file = PROCESSED_DIR / f"{filename}.tables_map.json"
 
         cached_pages = read_json_cache(cache_file)
         if cached_pages is not None:
-            print(f"Loading cached parse for {filename}...")
+            logger.info("Using cached parse for %s (%s pages)", filename, len(cached_pages))
             for page in cached_pages:
                 _append_section_docs(documents, page["text"], page["metadata"])
 
@@ -254,17 +277,19 @@ async def parse_documents(data_dir=None, files=None) -> tuple[list[Document], di
         write_json_cache(tables_cache_file, tables_map)
 
         # Parse text with LlamaParse
-        print(f"Uploading {filename} to LlamaCloud...")
+        logger.info("Uploading %s to LlamaCloud", filename)
         file_obj = await llama_cloud_client.files.create(file=file_path, purpose="parse")
 
-        print("Parsing file...")
+        logger.info("Parsing %s with LlamaParse", filename)
         result = await llama_cloud_client.parsing.parse(
             file_id=file_obj.id,
-            tier="agentic",
+            tier="cost_effective",
             version="latest",
-            agentic_options={"custom_prompt": "This is an equipment manual..."},
+            agentic_options={"custom_prompt": "This is an equipment manual."},
             output_options={
-                "markdown": {"tables": {"output_tables_as_markdown": True}},
+                "markdown": {
+                    "tables": {"output_tables_as_markdown": True}
+                },
                 "images_to_save": ["embedded"],
             },
             expand=["markdown", "images_content_metadata"],
@@ -280,10 +305,12 @@ async def parse_documents(data_dir=None, files=None) -> tuple[list[Document], di
 
         await _download_images(result)
         write_json_cache(cache_file, pages_to_save)
+        logger.info("Saved parse cache for %s with %s pages", filename, len(pages_to_save))
 
         for page in pages_to_save:
             _append_section_docs(documents, page["text"], page["metadata"])
 
+            logger.info("Parsing complete: %s text documents prepared", len(documents))
     return documents, all_tables_map
 
 

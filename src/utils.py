@@ -1,3 +1,5 @@
+import os
+import logging
 import re
 import json
 import yaml
@@ -18,6 +20,21 @@ IMAGE_DIR = PROCESSED_DIR / "images"
 
 for d in (RAW_DIR, PROCESSED_DIR, VECTOR_DIR, IMAGE_DIR):
     d.mkdir(parents=True, exist_ok=True)
+
+
+def setup_logging(level: str | None = None) -> None:
+    """Configure root logging once for the application."""
+    configured_level = (level or os.getenv("LOG_LEVEL") or "INFO").upper()
+    numeric_level = getattr(logging, configured_level, logging.INFO)
+
+    root_logger = logging.getLogger()
+    if not root_logger.handlers:
+        logging.basicConfig(
+            level=numeric_level,
+            format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        )
+    else:
+        root_logger.setLevel(numeric_level)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -44,14 +61,17 @@ def load_retriever_config() -> dict:
 def read_json_cache(path: Path):
     """Return parsed JSON if the file exists, else None."""
     if path.exists():
+        logging.getLogger(__name__).debug("Cache hit: %s", path)
         with open(path, "r") as f:
             return json.load(f)
+    logging.getLogger(__name__).debug("Cache miss: %s", path)
     return None
 
 
 def write_json_cache(path: Path, data) -> None:
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
+    logging.getLogger(__name__).debug("Cache written: %s", path)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

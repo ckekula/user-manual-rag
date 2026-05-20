@@ -6,6 +6,7 @@ async helpers for vision-based image description and table summarization.
 
 import os
 import base64
+import logging
 import httpx
 from dotenv import load_dotenv
 
@@ -18,6 +19,8 @@ from src.utils import load_llm_config
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 _cfg = load_llm_config()
@@ -27,10 +30,12 @@ if _env not in ("dev", "prod"):
     raise ValueError("APP_ENV must be 'dev' or 'prod'.")
 
 _env_cfg = _cfg[_env]
+logger.info("Initializing generator for APP_ENV=%s", _env)
 
 # ─── Embedding model ─────────────────────────────────────────────────────────
 
 embed_model = HuggingFaceEmbedding(model_name=_env_cfg["embedding_model"])
+logger.info("Embedding model initialized: %s", _env_cfg["embedding_model"])
 
 # ─── LLM ─────────────────────────────────────────────────────────────────────
 
@@ -47,6 +52,7 @@ else:
             "gpu_memory_utilization": vllm_cfg.get("gpu_memory_utilization", 0.5),
         },
     )
+logger.info("LLM initialized: %s", _env_cfg["llm_model"])
 
 Settings.llm = llm
 Settings.embed_model = embed_model
@@ -56,6 +62,7 @@ Settings.embed_model = embed_model
 
 async def describe_image(image_path: str) -> str:
     """Call a vision-capable LLM to generate a semantic description of an image."""
+    logger.debug("Describing image: %s", image_path)
     with open(image_path, "rb") as f:
         image_data = base64.b64encode(f.read()).decode("utf-8")
 
@@ -90,7 +97,9 @@ async def describe_image(image_path: str) -> str:
                 "max_tokens": max_tokens,
             },
         )
+        response.raise_for_status()
         result = response.json()
+        logger.debug("Image description generated for %s", image_path)
         return result["choices"][0]["message"]["content"].strip()
 
 
@@ -98,6 +107,7 @@ async def describe_image(image_path: str) -> str:
 
 async def summarize_table(markdown_table: str) -> str:
     """Use the text LLM to generate a semantic summary of a markdown table."""
+    logger.debug("Summarizing table markdown (%s chars)", len(markdown_table))
     table_model = _env_cfg["llm_model"]
     max_tokens = _cfg.get("table_summary_max_tokens", 150)
 
@@ -123,5 +133,7 @@ async def summarize_table(markdown_table: str) -> str:
                 "max_tokens": max_tokens,
             },
         )
+        response.raise_for_status()
         result = response.json()
+        logger.debug("Table summary generated")
         return result["choices"][0]["message"]["content"].strip()

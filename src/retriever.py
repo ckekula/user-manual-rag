@@ -9,6 +9,7 @@ Handles all retrieval concerns:
 """
 
 import os
+import logging
 from dotenv import load_dotenv
 
 from llama_index.retrievers.bm25 import BM25Retriever
@@ -25,6 +26,8 @@ from src.utils import VECTOR_DIR, load_retriever_config
 from src.generator import llm
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 COHERE_API_KEY = os.getenv("COHERE_API_KEY")
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
@@ -77,7 +80,7 @@ def build_index(documents=None):
                 "No documents provided and no persisted docstore found. "
                 "Upload at least one PDF first."
             )
-        print("Loading index from Qdrant + local docstore...")
+        logger.info("Loading index from Qdrant + local docstore")
         storage_context = StorageContext.from_defaults(
             vector_store=vector_store,
             persist_dir=docstore_path,
@@ -88,7 +91,7 @@ def build_index(documents=None):
         )
         # Retrieve nodes from docstore for BM25
         nodes = list(storage_context.docstore.docs.values())
-        print(f"Loaded {len(nodes)} nodes from docstore.")
+        logger.info("Loaded %s nodes from docstore", len(nodes))
         return index, nodes
 
     # ── Build path ───────────────────────────────────────────────────────────
@@ -96,11 +99,16 @@ def build_index(documents=None):
     chunk_overlap = _cfg.get("chunk_overlap", 50)
     splitter = SentenceSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
 
-    print("Chunking documents into nodes...")
+    logger.info(
+        "Chunking %s documents into nodes (chunk_size=%s, chunk_overlap=%s)",
+        len(documents),
+        chunk_size,
+        chunk_overlap,
+    )
     nodes = splitter.get_nodes_from_documents(documents)
-    print(f"Created {len(nodes)} nodes.")
+    logger.info("Created %s nodes", len(nodes))
 
-    print("Building Qdrant-backed index...")
+    logger.info("Building Qdrant-backed index in collection %s", QDRANT_COLLECTION)
     storage_context = StorageContext.from_defaults(
         vector_store=vector_store,
         # Docstore keeps node text/metadata locally for BM25
@@ -117,7 +125,7 @@ def build_index(documents=None):
 
     # Persist docstore (Qdrant persists itself)
     storage_context.persist(docstore_path)
-    print("Index built and persisted.")
+    logger.info("Index built and docstore persisted to %s", docstore_path)
 
     return index, nodes
 
@@ -134,8 +142,10 @@ def insert_nodes(index: VectorStoreIndex, new_nodes: list, persist: bool = True)
     deduped = [n for n in new_nodes if n.node_id not in existing_ids]
 
     if not deduped:
-        print("All nodes already indexed, skipping insert.")
+        logger.info("All %s nodes already indexed, skipping insert", len(new_nodes))
         return
+
+    logger.info("Inserting %s new nodes (%s provided)", len(deduped), len(new_nodes))
 
     for node in deduped:
         index.insert_nodes([node])
@@ -149,7 +159,7 @@ def insert_nodes(index: VectorStoreIndex, new_nodes: list, persist: bool = True)
 
     if persist:
         index.storage_context.persist(str(VECTOR_DIR))
-        print(f"Persisted {len(new_nodes)} new nodes to docstore.")
+        logger.info("Persisted %s new nodes to docstore", len(new_nodes))
 
 
 def get_all_nodes(index: VectorStoreIndex) -> list:
@@ -167,6 +177,14 @@ def build_hybrid_retriever(index: VectorStoreIndex, nodes: list) -> QueryFusionR
     top_k = ret_cfg.get("similarity_top_k", 10)
     num_queries = ret_cfg.get("num_queries", 1)
     mode = ret_cfg.get("mode", "reciprocal_rerank")
+
+    logger.info(
+        "Building hybrid retriever (top_k=%s, num_queries=%s, mode=%s, nodes=%s)",
+        top_k,
+        num_queries,
+        mode,
+        len(nodes),
+    )
 
     dense_retriever = index.as_retriever(similarity_top_k=top_k)
     bm25_retriever = BM25Retriever.from_defaults(nodes=nodes, similarity_top_k=top_k)
@@ -192,6 +210,8 @@ def build_query_engine(index: VectorStoreIndex, nodes: list) -> RetrieverQueryEn
         api_key=COHERE_API_KEY,
         top_n=reranker_cfg.get("top_n", 5),
     )
+
+    logger.info("Building query engine with Cohere reranker top_n=%s", reranker_cfg.get("top_n", 5))
 
     return RetrieverQueryEngine.from_args(
         hybrid_retriever,
