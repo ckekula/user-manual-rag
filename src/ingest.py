@@ -1,328 +1,463 @@
 """
 ingest.py
 Handles all document ingestion:
-  - PDF → text via LlamaParse
-  - PDF → images via PyMuPDF
-  - PDF → tables via pdfplumber
-  - Image description cache (uses generator.describe_image)
-  - Table summary cache (uses generator.summarize_table)
-  - Builds LlamaIndex Document objects for text, images, and tables
+  - PDF → text + structure via Docling (replaces LlamaParse + pdfplumber)
+  - PDF → images via PyMuPDF (noise-filtered, attached to text chunks)
+  - Tables → structured rows in SQLite + rich summary Documents for vector index
+  - Builds LlamaIndex Document objects for text and table summaries
 """
 
-import os
 import asyncio
+import json
 import logging
+import re
+import sqlite3
 from pathlib import Path
 
 import pymupdf
-import httpx
-import pdfplumber
+from docling.document_converter import DocumentConverter, PdfFormatOption
+from docling.datamodel.base_models import InputFormat
+from docling.datamodel.pipeline_options import PdfPipelineOptions
+from docling_core.types.doc import TableItem
 
-from dotenv import load_dotenv
-from llama_cloud import AsyncLlamaCloud
 from llama_index.core import Document
 
 from src.utils import (
     IMAGE_DIR,
     PROCESSED_DIR,
     RAW_DIR,
+    DB_PATH,
     read_json_cache,
     write_json_cache,
     rows_to_markdown,
-    split_markdown_by_section,
 )
-from src.generator import describe_image, summarize_table
-
-load_dotenv()
+from src.generator import summarize_table
 
 logger = logging.getLogger(__name__)
 
-LLAMA_CLOUD_API_KEY = os.getenv("LLAMA_CLOUD_API_KEY")
-llama_cloud_client = AsyncLlamaCloud(api_key=LLAMA_CLOUD_API_KEY)
+# ---------------------------------------------------------------------------
+# Docling converter — module-level singleton (loads models once)
+# ---------------------------------------------------------------------------
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Image extraction & description
-# ─────────────────────────────────────────────────────────────────────────────
+def _make_converter() -> DocumentConverter:
+    pipeline_options = PdfPipelineOptions()
+    pipeline_options.do_table_structure = True
+    pipeline_options.table_structure_options.do_cell_matching = True
+    # Keep images embedded so PictureItem.get_image() works
+    pipeline_options.images_scale = 2.0
+    pipeline_options.generate_picture_images = True
 
-def extract_images_from_pdf(pdf_path: str) -> None:
-    """Save every embedded image from *pdf_path* into IMAGE_DIR."""
-    logger.info("Extracting embedded images from %s", pdf_path)
-    total_images = 0
+    return DocumentConverter(
+        format_options={
+            InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
+        }
+    )
+
+_converter: DocumentConverter | None = None
+
+def get_converter() -> DocumentConverter:
+    global _converter
+    if _converter is None:
+        logger.info("Initializing Docling converter (loads layout models once)")
+        _converter = _make_converter()
+    return _converter
+
+
+# ---------------------------------------------------------------------------
+# SQLite table store
+# ---------------------------------------------------------------------------
+
+def init_db() -> None:
+    """Create the manual_tables store if it does not exist yet."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS manual_tables (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_name   TEXT    NOT NULL,
+                page        INTEGER NOT NULL,
+                table_index INTEGER NOT NULL,
+                col_names   TEXT    NOT NULL,
+                row_data    TEXT    NOT NULL,
+                UNIQUE (file_name, page, table_index, row_data)
+            )
+        """)
+        conn.commit()
+    logger.info("SQLite table store ready at %s", DB_PATH)
+
+
+def _insert_table_rows(
+    file_name: str,
+    page: int,
+    table_index: int,
+    headers: list[str],
+    rows: list[list[str]],
+) -> None:
+    col_names_json = json.dumps(headers)
+    records = [
+        (file_name, page, table_index, col_names_json,
+         json.dumps(dict(zip(headers, row))))
+        for row in rows
+        if any(cell.strip() for cell in row)
+    ]
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO manual_tables
+                (file_name, page, table_index, col_names, row_data)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            records,
+        )
+        conn.commit()
+    logger.debug(
+        "Inserted %s rows for %s p%s table %s",
+        len(records), file_name, page, table_index,
+    )
+
+
+def query_table(file_name: str, page: int, table_index: int) -> dict:
+    """
+    Return the full structured table as {col_names, rows}.
+    Called at query time after the LLM decides a table is relevant.
+    """
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute(
+            """
+            SELECT col_names, row_data
+            FROM   manual_tables
+            WHERE  file_name = ? AND page = ? AND table_index = ?
+            ORDER  BY id
+            """,
+            (file_name, page, table_index),
+        )
+        results = cursor.fetchall()
+
+    if not results:
+        return {"col_names": [], "rows": []}
+
+    col_names = json.loads(results[0][0])
+    rows = [json.loads(r[1]) for r in results]
+    return {"col_names": col_names, "rows": rows}
+
+
+# ---------------------------------------------------------------------------
+# Image extraction (noise-filtered, returns page → [filename] map)
+# ---------------------------------------------------------------------------
+
+def extract_images_from_pdf(pdf_path: str) -> dict[int, list[str]]:
+    """
+    Extract content images from *pdf_path* into IMAGE_DIR via PyMuPDF.
+
+    Filters out:
+      - Images appearing on > 30% of pages  (logos, watermarks)
+      - Images smaller than 100×100 px      (icons, bullets)
+      - Images with extreme aspect ratio    (banners, dividers)
+
+    Returns { page_num: [image_filename, ...] }  (1-indexed).
+    """
+    logger.info("Extracting images from %s", pdf_path)
     doc = pymupdf.open(pdf_path)
     stem = Path(pdf_path).stem
-    for page_index in range(len(doc)):
-        page = doc[page_index]
-        for img_index, img in enumerate(page.get_images(full=True)):
+    total_pages = len(doc)
+
+    # First pass: count appearances of each xref across pages
+    xref_page_count: dict[int, int] = {}
+    for page_index in range(total_pages):
+        for img in doc[page_index].get_images(full=True):
+            xref = img[0]
+            xref_page_count[xref] = xref_page_count.get(xref, 0) + 1
+
+    page_images: dict[int, list[str]] = {}
+
+    for page_index in range(total_pages):
+        page_num = page_index + 1
+        page_images[page_num] = []
+
+        for img_index, img in enumerate(doc[page_index].get_images(full=True)):
             xref = img[0]
             base_image = doc.extract_image(xref)
-            image_name = f"{stem}_page_{page_index + 1}_img_{img_index}.png"
+            width = base_image.get("width", 0)
+            height = base_image.get("height", 0)
+            aspect = width / height if height else 0
+
+            if xref_page_count[xref] > total_pages * 0.3:
+                logger.debug("Skip repeated image xref=%s (%s pages)", xref, xref_page_count[xref])
+                continue
+            if width < 100 or height < 100:
+                logger.debug("Skip small image xref=%s (%sx%s)", xref, width, height)
+                continue
+            if aspect > 8 or aspect < 0.125:
+                logger.debug("Skip banner image xref=%s aspect=%.2f", xref, aspect)
+                continue
+
+            image_name = f"{stem}_page_{page_num}_img_{img_index}.png"
             image_path = IMAGE_DIR / image_name
             with open(image_path, "wb") as f:
                 f.write(base_image["image"])
-                total_images += 1
-            logger.info("Extracted %s images from %s", total_images, pdf_path)
+            page_images[page_num].append(image_name)
+
+    total = sum(len(v) for v in page_images.values())
+    logger.info("Extracted %s content images from %s", total, pdf_path)
+    return page_images
 
 
-async def _download_images(result) -> None:
-    """Download images using presigned URLs from LlamaParse result."""
-    if not result.images_content_metadata:
-        logger.debug("No image metadata returned by parser")
-        return
+# ---------------------------------------------------------------------------
+# Docling parsing: text + tables + caption→image associations
+# ---------------------------------------------------------------------------
 
-    downloaded = 0
-    async with httpx.AsyncClient() as http:
-        for img_meta in result.images_content_metadata:
-            if not hasattr(img_meta, "filename") or not hasattr(img_meta, "presigned_url"):
-                continue
-            img_name = img_meta.filename
-            url = img_meta.presigned_url
-            if not img_name or not url:
-                continue
-            dest = IMAGE_DIR / img_name
-            if dest.exists():
-                continue
-            try:
-                logger.info("Downloading parsed image %s", img_name)
-                response = await http.get(url)
-                response.raise_for_status()
-                with open(dest, "wb") as f:
-                    f.write(response.content)
-                downloaded += 1
-            except Exception as e:
-                logger.warning("Could not download %s: %s", img_name, e)
-    logger.info("Downloaded %s parser images", downloaded)
-
-
-async def build_image_metadata_store() -> dict:
+def _table_grid_to_headers_and_rows(
+    table_item: TableItem,
+) -> tuple[list[str], list[list[str]]]:
     """
-    Describe every image in IMAGE_DIR once and cache the results.
+    Convert a Docling TableItem's grid into (headers, data_rows).
 
-    Returns:
-        { "page_1_img_0.png": {"path": ..., "description": ..., "page": ...}, ... }
+    Docling marks header cells with cell.column_header=True.
+    If no header row is detected, the first row is used as headers.
     """
-    cache_file = PROCESSED_DIR / "image_metadata.json"
-    image_metadata = read_json_cache(cache_file) or {}
+    grid = table_item.data.grid  # list[list[TableCell]]
+    if not grid:
+        return [], []
 
-    image_files = sorted(f for f in os.listdir(IMAGE_DIR) if f.endswith(".png"))
-    new_files = [f for f in image_files if f not in image_metadata]
+    # Collect header row indices (rows where every non-empty cell is a column header)
+    header_row_indices = set()
+    for row_idx, row in enumerate(grid):
+        if any(cell.column_header for cell in row):
+            header_row_indices.add(row_idx)
 
-    if not new_files:
-        logger.info("Image metadata cache up to date (%s images)", len(image_metadata))
-        return image_metadata
+    if header_row_indices:
+        # Merge text from all header rows into one header list
+        headers = []
+        for col_idx in range(len(grid[0])):
+            parts = [
+                grid[r][col_idx].text.strip()
+                for r in sorted(header_row_indices)
+                if grid[r][col_idx].text.strip()
+            ]
+            headers.append(" ".join(parts) if parts else f"Col{col_idx}")
+        data_rows = [
+            [cell.text.strip() for cell in row]
+            for row_idx, row in enumerate(grid)
+            if row_idx not in header_row_indices
+        ]
+    else:
+        # Fall back: treat first row as headers
+        headers = [cell.text.strip() or f"Col{i}" for i, cell in enumerate(grid[0])]
+        data_rows = [
+            [cell.text.strip() for cell in row]
+            for row in grid[1:]
+        ]
 
-    logger.info("Describing %s new images", len(new_files))
-
-    # Describe new images in parallel
-    async def _describe(img_name: str):
-        img_path = str(IMAGE_DIR / img_name)
-        try:
-            description = await describe_image(img_path)
-        except Exception as e:
-            logger.warning("Could not describe %s: %s", img_name, e)
-            description = "Unknown image content"
-
-        try:
-            page_num = int(img_name.split("_")[1])
-        except (IndexError, ValueError):
-            page_num = -1
-        return img_name, {"path": img_path, "description": description, "page": page_num}
-
-    results = await asyncio.gather(*[_describe(f) for f in new_files])
-    image_metadata.update(dict(results))
-
-    write_json_cache(cache_file, image_metadata)
-    logger.info("Image metadata store updated to %s total entries", len(image_metadata))
-    return image_metadata
-
-
-def build_image_documents(image_metadata: dict) -> list[Document]:
-    """Turn each image into a Document whose text is its semantic description."""
-    return [
-        Document(
-            text=meta["description"],
-            metadata={
-                "type": "image",
-                "image_path": meta["path"],
-                "image_name": img_name,
-                "page": meta["page"],
-            },
-        )
-        for img_name, meta in image_metadata.items()
-    ]
+    return headers, data_rows
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Table extraction & summarization
-# ─────────────────────────────────────────────────────────────────────────────
-
-def extract_tables_from_pdf(pdf_path: str) -> dict:
-    """Return { page_num: [markdown_table, ...], ... } for all pages."""
-    logger.info("Extracting tables from %s", pdf_path)
-    tables_per_page: dict = {}
-    total_tables = 0
-    with pdfplumber.open(pdf_path) as pdf:
-        for i, page in enumerate(pdf.pages):
-            formatted_tables = []
-            for table in page.extract_tables() or []:
-                if not table or not table[0]:
-                    continue
-                formatted_tables.append(rows_to_markdown(table[0], table[1:]))
-                total_tables += 1
-            tables_per_page[i + 1] = formatted_tables
-    logger.info("Extracted %s tables from %s", total_tables, pdf_path)
-    return tables_per_page
-
-
-async def build_table_metadata_store(tables_map: dict, filename: str) -> list[dict]:
+def _parse_with_docling(
+    file_path: str,
+    filename: str,
+) -> tuple[list[dict], dict[int, list[dict]], dict[int, list[str]]]:
     """
-    Summarize every table for *filename* once and cache the results.
+    Run Docling on *file_path* and return three structures:
 
-    Returns a list of dicts with keys: summary, markdown, file_name, page, table_index.
+      pages_data       — [{"text": markdown_str, "metadata": {...}}, ...]
+                         One entry per page, markdown has tables replaced with
+                         placeholders so the text chunks stay clean.
+
+      page_table_meta  — {page_num: [{table_index, headers, sample_rows}, ...]}
+                         Used to build SQLite rows and rich summaries.
+
+      picture_page_map — {page_num: [image_filename, ...]}
+                         Images from Docling's own extraction, keyed by page.
+                         These are merged with PyMuPDF's map in parse_documents.
     """
-    cache_file = PROCESSED_DIR / f"{filename}.tables.json"
+    logger.info("Running Docling on %s", filename)
+    result = get_converter().convert(file_path)
+    doc = result.document
+
+    # ── Build page_table_meta ────────────────────────────────────────────────
+    page_table_meta: dict[int, list[dict]] = {}
+    table_index_by_page: dict[int, int] = {}  # running counter per page
+
+    for table_item in doc.tables:
+        if not table_item.prov:
+            continue
+        page_num = table_item.prov[0].page_no
+
+        headers, data_rows = _table_grid_to_headers_and_rows(table_item)
+        if not headers:
+            continue
+
+        t_idx = table_index_by_page.get(page_num, 0)
+        table_index_by_page[page_num] = t_idx + 1
+
+        _insert_table_rows(filename, page_num, t_idx, headers, data_rows)
+
+        page_table_meta.setdefault(page_num, []).append({
+            "table_index": t_idx,
+            "headers": headers,
+            "sample_rows": data_rows[:3],
+        })
+
+    # ── Build picture_page_map from Docling's picture items ─────────────────
+    # These supplement PyMuPDF's extraction for figures that Docling explicitly
+    # identified and linked to captions.
+    picture_page_map: dict[int, list[str]] = {}
+    stem = Path(file_path).stem
+
+    for pic_item in doc.pictures:
+        if not pic_item.prov:
+            continue
+        page_num = pic_item.prov[0].page_no
+        pil_img = pic_item.get_image(doc)
+        if pil_img is None:
+            continue
+
+        pic_idx = len(picture_page_map.get(page_num, []))
+        image_name = f"{stem}_docling_page_{page_num}_pic_{pic_idx}.png"
+        image_path = IMAGE_DIR / image_name
+        pil_img.save(image_path)
+        picture_page_map.setdefault(page_num, []).append(image_name)
+
+    logger.info(
+        "Docling: %s tables, %s pictures across %s pages",
+        sum(len(v) for v in page_table_meta.values()),
+        sum(len(v) for v in picture_page_map.values()),
+        len(doc.pages),
+    )
+
+    # ── Build pages_data using per-page markdown export ──────────────────────
+    pages_data: list[dict] = []
+    for page_no in sorted(doc.pages.keys()):
+        page_md = doc.export_to_markdown(page_no=page_no)
+        pages_data.append({
+            "text": page_md,
+            "metadata": {"file_name": filename, "page": page_no},
+        })
+
+    return pages_data, page_table_meta, picture_page_map
+
+
+# ---------------------------------------------------------------------------
+# Table summarization
+# ---------------------------------------------------------------------------
+
+async def _build_table_documents(
+    page_table_meta: dict[int, list[dict]],
+    filename: str,
+) -> list[Document]:
+    cache_file = PROCESSED_DIR / f"{filename}.table_summaries.json"
     cached = read_json_cache(cache_file)
     if cached is not None:
-        logger.info("Using cached table metadata for %s (%s records)", filename, len(cached))
-        return cached
+        logger.info("Using cached table summaries for %s (%s tables)", filename, len(cached))
+        return _table_summary_records_to_docs(cached)
 
-    table_records: list[dict] = []
-    logger.info("Summarizing tables for %s", filename)
+    # Flatten and summarize all tables in parallel
+    all_metas = [
+        (page_num, meta)
+        for page_num, tables in page_table_meta.items()
+        for meta in tables
+    ]
 
-    for page_num, tables in tables_map.items():
-        for idx, markdown_table in enumerate(tables):
-            logger.info("Summarizing table page=%s index=%s for %s", page_num, idx, filename)
-            try:
-                summaries = await summarize_table(markdown_table)
-                summary = summaries[0]
-            except Exception as e:
-                logger.warning("Could not summarize table p%s#%s for %s: %s", page_num, idx, filename, e)
-                summary = "A table from the equipment manual."
+    records = list(await asyncio.gather(*[
+        _summarize_one_table(meta, filename, page_num)
+        for page_num, meta in all_metas
+    ]))
 
-            table_records.append({
-                "summary": summary,
-                "markdown": markdown_table,
-                "file_name": filename,
-                "page": page_num,
-                "table_index": idx,
-            })
-
-    write_json_cache(cache_file, table_records)
-    logger.info("Saved summaries for %s tables in %s", len(table_records), filename)
-    return table_records
+    write_json_cache(cache_file, records)
+    logger.info("Saved %s table summaries for %s", len(records), filename)
+    return _table_summary_records_to_docs(records)
 
 
-def build_table_documents(table_records: list[dict]) -> list[Document]:
-    """Turn each table record into a Document whose searchable text is its summary."""
+async def _summarize_one_table(meta: dict, filename: str, page_num: int) -> dict:
+    headers = meta["headers"]
+    sample_rows = meta["sample_rows"]
+    table_index = meta["table_index"]
+
+    sample_md = rows_to_markdown(headers, sample_rows)
+
+    try:
+        summary = await summarize_table(sample_md)
+    except Exception as e:
+        logger.warning(
+            "Could not summarize table p%s#%s for %s: %s",
+            page_num, table_index, filename, e,
+        )
+        summary = f"Table with columns: {', '.join(headers)}."
+
+    col_str = ", ".join(headers)
+    sample_values = [
+        str(cell).strip()
+        for row in sample_rows
+        for cell in row
+        if cell and str(cell).strip()
+    ]
+    value_str = "; ".join(sample_values[:10])
+
+    return {
+        "summary": f"{summary} Columns: {col_str}. Sample values: {value_str}.",
+        "file_name": filename,
+        "page": page_num,
+        "table_index": table_index,
+    }
+
+
+def _table_summary_records_to_docs(records: list[dict]) -> list[Document]:
     return [
         Document(
             text=record["summary"],
             metadata={
-                "type": "table",
-                "table_markdown": record["markdown"],
+                "type": "table_summary",
                 "file_name": record["file_name"],
                 "page": record["page"],
                 "table_index": record["table_index"],
             },
         )
-        for record in table_records
+        for record in records
     ]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PDF parsing via LlamaParse
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Section splitting + Document assembly
+# ---------------------------------------------------------------------------
 
-async def parse_documents(data_dir=None, files=None) -> tuple[list[Document], dict]:
+# Heading pattern used to split Docling's per-page markdown into sections
+_HEADING_RE = re.compile(r"^#{1,6}\s+(.+)$", re.MULTILINE)
+
+
+def _split_markdown_into_sections(markdown_text: str) -> list[tuple[str, str]]:
     """
-    Parse all PDFs in *data_dir* (defaults to RAW_DIR).
-
-    Returns:
-        (text_documents, all_tables_map)
-        where all_tables_map = { filename: { page_num: [markdown, ...] } }
+    Split markdown into (section_title, content) pairs on heading boundaries.
+    Content before the first heading gets title "General".
     """
-    if data_dir is None:
-        data_dir = RAW_DIR
+    sections: list[tuple[str, str]] = []
+    current_title = "General"
+    last_end = 0
 
-    documents: list[Document] = []
-    all_tables_map: dict = {}
+    for m in _HEADING_RE.finditer(markdown_text):
+        content = markdown_text[last_end:m.start()].strip()
+        if content:
+            sections.append((current_title, content))
+        current_title = m.group(1).strip()
+        last_end = m.end()
 
-    filenames = os.listdir(data_dir) if files is None else files
-    logger.info("Starting parse for %s candidate files in %s", len(filenames), data_dir)
-    for filename in filenames:
-        if not filename.endswith(".pdf"):
-            continue
+    tail = markdown_text[last_end:].strip()
+    if tail:
+        sections.append((current_title, tail))
 
-        logger.info("Processing PDF %s", filename)
-
-        cache_file = PROCESSED_DIR / f"{filename}.json"
-        tables_cache_file = PROCESSED_DIR / f"{filename}.tables_map.json"
-
-        cached_pages = read_json_cache(cache_file)
-        if cached_pages is not None:
-            logger.info("Using cached parse for %s (%s pages)", filename, len(cached_pages))
-            for page in cached_pages:
-                _append_section_docs(documents, page["text"], page["metadata"])
-
-            cached_tables = read_json_cache(tables_cache_file)
-            if cached_tables is not None:
-                all_tables_map[filename] = cached_tables
-            continue
-
-        file_path = str(data_dir / filename)
-
-        # Extract images and tables locally
-        extract_images_from_pdf(file_path)
-        tables_map = extract_tables_from_pdf(file_path)
-        all_tables_map[filename] = tables_map
-        write_json_cache(tables_cache_file, tables_map)
-
-        # Parse text with LlamaParse
-        logger.info("Uploading %s to LlamaCloud", filename)
-        file_obj = await llama_cloud_client.files.create(file=file_path, purpose="parse")
-
-        logger.info("Parsing %s with LlamaParse", filename)
-        result = await llama_cloud_client.parsing.parse(
-            file_id=file_obj.id,
-            tier="cost_effective",
-            version="latest",
-            agentic_options={"custom_prompt": "This is an equipment manual."},
-            output_options={
-                "markdown": {
-                    "tables": {"output_tables_as_markdown": True}
-                },
-                "images_to_save": ["embedded"],
-            },
-            expand=["markdown", "images_content_metadata"],
-        )
-
-        pages_to_save = [
-            {
-                "text": page.markdown,
-                "metadata": {"file_name": filename, "page": page.page_number},
-            }
-            for page in result.markdown.pages
-        ]
-
-        await _download_images(result)
-        write_json_cache(cache_file, pages_to_save)
-        logger.info("Saved parse cache for %s with %s pages", filename, len(pages_to_save))
-
-        for page in pages_to_save:
-            _append_section_docs(documents, page["text"], page["metadata"])
-
-            logger.info("Parsing complete: %s text documents prepared", len(documents))
-    return documents, all_tables_map
+    return sections
 
 
 def _append_section_docs(
     documents: list[Document],
     markdown_text: str,
     base_metadata: dict,
+    page_images: list[str],
 ) -> None:
-    """Split markdown into sections and append one Document per section."""
-    for section_title, section_text in split_markdown_by_section(markdown_text):
+    """
+    Split one page's markdown into section-level Documents and append to *documents*.
+    Each Document carries the filtered image filenames for its page.
+    """
+    for section_title, section_text in _split_markdown_into_sections(markdown_text):
         if not section_text.strip():
-            continue  # skip empty sections
+            continue
         documents.append(
             Document(
                 text=section_text,
@@ -330,6 +465,97 @@ def _append_section_docs(
                     **base_metadata,
                     "section": section_title,
                     "type": "text",
+                    "images": page_images,
                 },
             )
         )
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+
+async def parse_documents(data_dir=None, files=None) -> list[Document]:
+    """
+    Parse all PDFs in *data_dir* (defaults to RAW_DIR).
+
+    For each PDF:
+      - Runs Docling for text extraction and table structure recognition.
+      - Runs PyMuPDF for noise-filtered image extraction.
+      - Merges Docling picture items with PyMuPDF images per page.
+      - Writes table rows to SQLite; generates rich summary Documents.
+      - Splits per-page markdown into section-level text Documents with
+        attached image references.
+
+    Returns a flat list of Documents (type='text' and type='table_summary').
+    """
+    if data_dir is None:
+        data_dir = RAW_DIR
+
+    init_db()
+    documents: list[Document] = []
+
+    filenames = list(files) if files is not None else [
+        f for f in (data_dir).iterdir() if f.suffix == ".pdf" and f.is_file()
+        # iterdir gives Path objects; convert below
+    ]
+    # Normalise to plain filenames when data_dir iteration returns Path objects
+    filenames = [
+        f.name if isinstance(f, Path) else f
+        for f in (data_dir.iterdir() if files is None else files)
+    ]
+
+    logger.info("Starting parse for %s candidate files in %s", len(filenames), data_dir)
+
+    for filename in filenames:
+        if not filename.endswith(".pdf"):
+            continue
+
+        logger.info("Processing %s", filename)
+        file_path = str(data_dir / filename)
+
+        # ── Image extraction via PyMuPDF ─────────────────────────────────────
+        pymupdf_page_images = extract_images_from_pdf(file_path)
+
+        # ── Docling parse (text + tables + docling pictures) ─────────────────
+        docling_cache = PROCESSED_DIR / f"{filename}.docling.json"
+        tables_cache = PROCESSED_DIR / f"{filename}.page_table_meta.json"
+
+        if read_json_cache(docling_cache) is not None:
+            logger.info("Using cached Docling output for %s", filename)
+            pages_data = read_json_cache(docling_cache)
+            page_table_meta = read_json_cache(tables_cache) or {}
+            docling_page_images: dict[int, list[str]] = {}
+        else:
+            pages_data, page_table_meta, docling_page_images = _parse_with_docling(
+                file_path, filename
+            )
+            write_json_cache(docling_cache, pages_data)
+            write_json_cache(tables_cache, page_table_meta)
+
+        # ── Merge image sources: prefer PyMuPDF; supplement with Docling ─────
+        # PyMuPDF gives us all embedded images with noise filtering.
+        # Docling picture items add figures it explicitly recognised
+        # (e.g. rendered vector graphics PyMuPDF may miss).
+        all_page_images: dict[int, list[str]] = {}
+        all_pages = set(pymupdf_page_images) | set(docling_page_images)
+        for p in all_pages:
+            combined = pymupdf_page_images.get(p, []) + [
+                img for img in docling_page_images.get(p, [])
+                if img not in pymupdf_page_images.get(p, [])
+            ]
+            all_page_images[p] = combined
+
+        # ── Table summary Documents ───────────────────────────────────────────
+        table_docs = await _build_table_documents(page_table_meta, filename)
+        documents.extend(table_docs)
+        logger.info("Added %s table summary documents for %s", len(table_docs), filename)
+
+        # ── Text Documents ────────────────────────────────────────────────────
+        for page in pages_data:
+            page_num = page["metadata"].get("page")
+            page_imgs = all_page_images.get(page_num, [])
+            _append_section_docs(documents, page["text"], page["metadata"], page_imgs)
+
+    logger.info("Parsing complete: %s total documents", len(documents))
+    return documents

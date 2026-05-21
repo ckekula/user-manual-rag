@@ -17,6 +17,7 @@ RAW_DIR = DATA_DIR / "raw"
 PROCESSED_DIR = DATA_DIR / "processed"
 VECTOR_DIR = DATA_DIR / "vectordb"
 IMAGE_DIR = PROCESSED_DIR / "images"
+DB_PATH = DATA_DIR / "tables.db"
 
 for d in (RAW_DIR, PROCESSED_DIR, VECTOR_DIR, IMAGE_DIR):
     d.mkdir(parents=True, exist_ok=True)
@@ -80,7 +81,7 @@ def write_json_cache(path: Path, data) -> None:
 
 def clean_llm_output(text: str) -> str:
     """Strip chain-of-thought <think> blocks and extra whitespace."""
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<think>.*?(?:</think>|$)", "", text, flags=re.DOTALL | re.IGNORECASE)
     return text.strip()
 
 

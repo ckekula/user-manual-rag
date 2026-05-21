@@ -1,12 +1,11 @@
 """
 generator.py
 Initializes the LLM and embedding model from config, and exposes
-async helpers for vision-based image description and table summarization.
+an async helper for table summarization.
 """
 
-import os
-import base64
 import logging
+import os
 import httpx
 from dotenv import load_dotenv
 
@@ -58,58 +57,18 @@ Settings.llm = llm
 Settings.embed_model = embed_model
 
 
-# ─── Vision: image description ───────────────────────────────────────────────
-
-async def describe_image(image_path: str) -> str:
-    """Call a vision-capable LLM to generate a semantic description of an image."""
-    logger.debug("Describing image: %s", image_path)
-    with open(image_path, "rb") as f:
-        image_data = base64.b64encode(f.read()).decode("utf-8")
-
-    vision_model = _cfg.get("vision_model", "meta-llama/llama-4-scout-17b-16e-instruct")
-    max_tokens = _cfg.get("vision_max_tokens", 150)
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-            json={
-                "model": vision_model,
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/png;base64,{image_data}"},
-                        },
-                        {
-                            "type": "text",
-                            "text": (
-                                "You are analyzing an image from an equipment manual. "
-                                "In 1-2 sentences, describe what this image shows "
-                                "(e.g. wiring diagram, component location, warning label, "
-                                "installation step, exploded-view diagram, etc.) and note "
-                                "any key labels, part numbers, or values visible."
-                            ),
-                        },
-                    ],
-                }],
-                "max_tokens": max_tokens,
-            },
-        )
-        response.raise_for_status()
-        result = response.json()
-        logger.debug("Image description generated for %s", image_path)
-        return result["choices"][0]["message"]["content"].strip()
-
-
 # ─── Table summarization ──────────────────────────────────────────────────────
 
 async def summarize_table(markdown_table: str) -> str:
-    """Use the text LLM to generate a semantic summary of a markdown table."""
+    """
+    Generate a semantic summary of a markdown table snippet.
+
+    The caller is responsible for passing a representative sample
+    (headers + a few rows) rather than the full table.
+    """
     logger.debug("Summarizing table markdown (%s chars)", len(markdown_table))
     table_model = _env_cfg["llm_model"]
-    max_tokens = _cfg.get("table_summary_max_tokens", 150)
+    max_tokens = _cfg.get("table_summary_max_tokens", 200)
 
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(
@@ -124,8 +83,10 @@ async def summarize_table(markdown_table: str) -> str:
                             "You are analyzing a table from an equipment manual. "
                             "Summarize what this table contains in 1-2 sentences: "
                             "what kind of data it holds (e.g. torque specs, part numbers, "
-                            "wiring pin assignments, operating limits, error codes, etc.) "
-                            "and the key column names or values. Be specific and concise."
+                            "wiring pin assignments, operating limits, error codes) "
+                            "and the key column names or values. Be specific and concise. "
+                            "Do not include column names or sample values in your reply — "
+                            "those will be appended separately."
                         ),
                     },
                     {"role": "user", "content": markdown_table},
@@ -135,5 +96,6 @@ async def summarize_table(markdown_table: str) -> str:
         )
         response.raise_for_status()
         result = response.json()
-        logger.debug("Table summary generated")
-        return result["choices"][0]["message"]["content"].strip()
+        summary = result["choices"][0]["message"]["content"].strip()
+        logger.debug("Table summary generated (%s chars)", len(summary))
+        return summary
